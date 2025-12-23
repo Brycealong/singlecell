@@ -1,0 +1,312 @@
+---
+title: "Integrative analysis in Seurat v5"
+output:
+  html_document:
+    theme: united
+  pdf_document: default
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = 'styler',
+  fig.width = 8,
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE,
+  error = TRUE
+)
+```
+
+```{r init}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+```
+
+## Introduction
+Integration of single-cell sequencing datasets, for example across experimental batches, donors, or conditions, is often an important step in scRNA-seq workflows. Integrative analysis can help to match shared cell types and states across datasets, which can boost statistical power, and most importantly, facilitate accurate comparative analysis across datasets. In previous versions of Seurat we introduced methods for integrative analysis, including our ‘anchor-based’ integration workflow. Many labs have also published powerful and pioneering methods, including [Harmony](https://github.com/immunogenomics/harmony) and [scVI](https://yoseflab.github.io/software/scvi-tools/), for integrative analysis. 
+We recognize that while the goal of matching shared cell types across datasets may be important for many problems, users may also be concerned about which method to use, or that integration could result in a loss of biological resolution. In Seurat v5, we introduce more flexible and streamlined infrastructure to run different integration algorithms with a single line of code. This makes it easier to explore the results of different integration methods, and to compare these results to a workflow that excludes integration steps.
+For this vignette, we use a [dataset of human PBMC profiled with seven different technologies](https://www.nature.com/articles/s41587-020-0465-8), profiled as part of a systematic comparative analysis (`pbmcsca`). The data is available as part of our [SeuratData](https://github.com/satijalab/seurat-data) package. 
+
+## Layers in the Seurat v5 object
+Seurat v5 assays store data in layers. These layers can store raw, un-normalized counts (`layer='counts'`), normalized data (`layer='data'`), or z-scored/variance-stabilized data (`layer='scale.data'`). We can load in the data, remove low-quality cells, and obtain predicted cell annotations (which will be useful for assessing integration later), using our [Azimuth pipeline](https://satijalab.github.io/azimuth/articles/run_azimuth_tutorial.html).
+
+```{r installdata, include=FALSE, eval=TRUE}
+InstallData("pbmcref")
+```
+
+```{r loadannotate, message=FALSE}
+# load in the pbmc systematic comparative analysis dataset
+obj <- LoadData("pbmcsca")
+obj  <- subset(obj, nFeature_RNA > 1000)
+obj <- RunAzimuth(obj, reference = "pbmcref")
+# currently, the object has two layers in the RNA assay: counts, and data
+obj
+```
+
+```{r}
+file_list = list.files(pattern = "\\.csv$")
+file_list
+```
+
+```{r}
+obj_list <- lapply(file_list, function(file) {
+  counts <- read.csv(file, comment.char = "#", row.names = 1)
+  counts <- t(counts)
+  obj <- CreateSeuratObject(counts = counts, project = basename(file), min.cells = 3, min.features = 200)
+  
+  parts <- unlist(strsplit(file, "_"))
+  obj$ind <- parts[1]
+  obj$tissue <- parts[2]
+  return(obj)
+})
+```
+
+```{r}
+obj <- merge(obj_list[[1]], obj_list[2:6])
+obj@meta.data
+saveRDS(obj, file = "./output/obj_raw_counts.rds")
+```
+
+```{r qc}
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT\\.")
+# Show QC metrics for the first 5 cells
+head(pbmc@meta.data, 5)
+```
+```{r qc2, fig.height=7, fig.width=13}
+
+#Visualize QC metrics as a violin plot
+VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt") 
+plot2 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") 
+plot1
+plot2
+
+obj <- subset(obj, subset = nFeature_RNA > 200 & nFeature_RNA < 3000 & percent.mt < 5)
+obj
+```
+```{r}
+obj <- JoinLayers(obj)
+obj <- NormalizeData(obj)
+obj <- FindVariableFeatures(obj)
+obj <- ScaleData(obj)
+obj <- RunPCA(obj)
+obj
+```
+
+```{r singler}
+library(SingleCellExperiment)
+library(SingleR)
+library(celldex)
+
+sce <- as.SingleCellExperiment(obj)
+sce
+```
+```{r}
+ref.set <- celldex::HumanPrimaryCellAtlasData()
+pred.cnts <- SingleR::SingleR(test = sce, ref = ref.set, labels = ref.set$label.main)
+obj$singleR.labels <- pred.cnts$labels
+obj@meta.data
+```
+
+
+The object contains data from nine different batches (stored in the `Method` column in the object metadata), representing seven different technologies. We will aim to integrate the different batches together. In previous versions of Seurat, we would require the data to be represented as nine different Seurat objects. When using Seurat v5 assays, we can instead keep all the data in one object, but simply split the layers.
+After splitting, there are now 18 layers (a `counts` and `data` layer for each batch). We can also run a standard scRNA-seq analysis (i.e. without integration). Note that since the data is split into layers, normalization and variable feature identification is performed for each batch independently (a consensus set of variable features is automatically identified).
+```{r splitassay}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$orig.ident)
+obj
+# obj <- NormalizeData(obj)
+# obj <- FindVariableFeatures(obj)
+# obj <- ScaleData(obj)
+# obj <- RunPCA(obj)
+```
+We can now visualize the results of a standard analysis without integration. Note that cells are grouping both by cell type and by underlying method. While a UMAP analysis is just a visualization of this, clustering this dataset would return predominantly batch-specific clusters. Especially if previous cell-type annotations were not available, this would make downstream analysis extremely challenging.  
+```{r unintegratedUMAP, fig.height=5, fig.width=14}
+obj <- FindNeighbors(obj, dims=1:30, reduction = 'pca')
+obj <- FindClusters(obj, resolution = 2, cluster.name = "unintegrated_clusters")
+obj <- RunUMAP(obj, dims = 1:30, reduction = 'pca', reduction.name = 'umap.unintegrated')
+# visualize by batch and cell type annotation
+# cell type annotations were previously added by Azimuth
+DimPlot(obj, reduction = 'umap.unintegrated', group.by=c('Method','predicted.celltype.l2'))
+```
+```{r}
+
+```
+
+## Perform streamlined (one-line) integrative analysis
+
+Seurat v5 enables streamlined integrative analysis using the `IntegrateLayers` function. The method currently supports five integration methods. Each of these methods performs integration in low-dimensional space, and returns a dimensional reduction (i.e. `integrated.rpca`) that aims to co-embed shared cell types across batches:
+
+* Anchor-based CCA integration (`method=CCAIntegration`)
+* Anchor-based RPCA integration (`method=RPCAIntegration`)
+* Harmony (`method=HarmonyIntegration`)
+* FastMNN (`method= FastMNNIntegration`)
+* scVI (`method=scVIIntegration`)
+
+Note that our anchor-based RPCA integration represents a faster and more conservative (less correction) method for integration. For interested users, we discuss this method in more detail in our [previous RPCA vignette](https://satijalab.org/seurat/articles/integration_rpca)
+
+You can find more detail on each method, and any installation prerequisites, in Seurat's documentation (for example, `?scVIIntegration`). For example, scVI integration requires `reticulate` which can be installed from CRAN (`install.packages("reticulate")`) as well as `scvi-tools` and its dependencies installed in a conda environment. Please see scVI installation instructions [here](https://docs.scvi-tools.org/en/stable/installation.html).
+
+
+Each of the following lines perform a new integration using a single line of code:
+
+```{r integratelayerscca, results='hide'}
+obj <- IntegrateLayers(
+  object = obj, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = 'integrated.cca',
+  verbose = FALSE)
+```
+
+```{r integratelayersrpca, results='hide'}
+obj <- IntegrateLayers(
+  object = obj, method = RPCAIntegration,
+  orig.reduction = "pca", new.reduction = 'integrated.rpca',
+  verbose = FALSE)
+```
+
+```{r integratelayersharmony, results='hide'}
+obj <- IntegrateLayers(
+  object = obj, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = 'harmony',
+  verbose = T)
+```
+
+```{r integratelayersfastmnn, results='hide'}
+obj <- IntegrateLayers(
+  object = obj, method = FastMNNIntegration,
+  new.reduction = 'integrated.mnn',
+  verbose = FALSE)
+```
+
+```{r integratelayersscvi, eval=FALSE, results='hide'}
+obj <- IntegrateLayers(
+  object = obj, method = scVIIntegration,
+  new.reduction = 'integrated.scvi',
+  conda_env = '../miniconda3/envs/scvi-env', verbose = FALSE)
+```
+
+```{r addscvi, include=FALSE}
+scvi.reduc <- readRDS("/brahms/haoy/seurat5/object/pbmcsca_scvi.dr.rds")@cell.embeddings
+scvi.reduc <- scvi.reduc[Cells(obj),]
+obj[["integrated.scvi"]] <- CreateDimReducObject(embeddings = scvi.reduc)
+```
+
+For any of the methods, we can now visualize and cluster the datasets. We show this for CCA integration and scVI, but you can do this for any method:
+
+```{r integratedprojections, fig.height=16, fig.width=16}
+obj <- FindNeighbors(obj, reduction = 'harmony', dims = 1:30)
+obj <- FindClusters(obj, resolution = 2, cluster.name = 'harmony_clusters')
+obj <- RunUMAP(obj, reduction = "harmony", dims = 1:30, reduction.name = 'umap.harmony')
+p1 <- DimPlot(
+  obj, reduction = "umap.harmony",
+  group.by = c("ind", "tissue", "singleR.labels", "harmony_clusters"),
+  combine = FALSE, label.size = 2) 
+p1
+
+# obj <- FindNeighbors(obj, reduction = 'integrated.scvi', dims = 1:30)
+# obj <- FindClusters(obj,resolution = 2, cluster.name = 'scvi_clusters')
+# obj <- RunUMAP(obj, reduction = "integrated.scvi", dims = 1:30, reduction.name = 'umap.scvi')
+# p2 <- DimPlot(
+#   obj, reduction = "umap.scvi",
+#   group.by = c("Method", "predicted.celltype.l2", "scvi_clusters"),
+#   combine = FALSE, label.size = 2)
+
+# wrap_plots(c(p1, p2), ncol = 2, byrow = F)
+```
+```{r}
+table(obj$ind, obj$tissue)
+```
+```{r}
+obj
+obj <- JoinLayers(obj)
+```
+
+```{r}
+obj$celltype.tissue <- paste(obj$singleR.labels, obj$tissue, sep = "_")
+Idents(obj) <- "celltype.tissue"
+epi.response <- FindMarkers(obj, ident.1 = "Epithelial_cells_Ca", ident.2 = "Epithelial_cells_N", verbose = FALSE)
+head(epi.response, n = 15)
+```
+
+```{r feature.heatmaps, fig.height = 10, fig.width=10}
+FeaturePlot(obj, features = c("STMN1", "CDKN2A", "KRT5"), split.by = "tissue", max.cutoff = 3, cols = c("grey",
+    "red"), reduction = "umap.harmony")
+```
+```{r splitvln, fig.height = 12}
+plots <- VlnPlot(obj, features = c("LYZ", "ISG15", "CXCL10"), split.by = "tissue", group.by = "singleR.labels", pt.size = 0, combine = FALSE)
+wrap_plots(plots = plots, ncol = 1)
+```
+
+We hope that by simplifying the process of performing integrative analysis, users can more carefully evaluate the biological information retained in the integrated dataset. For example, users can compare the expression of biological markers based on different clustering solutions, or visualize one method's clustering solution on different UMAP visualizations.
+
+```{r vlnplots, fig.height=5, fig.width=16, warning=FALSE}
+p1 <- VlnPlot(
+  obj, features = "rna_CD8A", group.by = 'unintegrated_clusters'
+) + NoLegend() + ggtitle("CD8A - Unintegrated Clusters")
+p2 <- VlnPlot(
+  obj, "rna_CD8A", group.by = 'cca_clusters'
+) + NoLegend() + ggtitle("CD8A - CCA Clusters")
+p3 <- VlnPlot(
+  obj, "rna_CD8A", group.by = 'scvi_clusters'
+) + NoLegend() + ggtitle("CD8A - scVI Clusters")
+p1 | p2 | p3
+```
+
+```{r umaps, fig.height=5, fig.width=16}
+obj <- RunUMAP(obj, reduction = "integrated.rpca", dims = 1:30, reduction.name = 'umap.rpca')
+p4 <- DimPlot(obj, reduction="umap.unintegrated", group.by=c("cca_clusters"))
+p5 <- DimPlot(obj, reduction="umap.rpca", group.by=c("cca_clusters"))
+p6 <- DimPlot(obj, reduction="umap.scvi", group.by=c("cca_clusters"))
+p4 | p5 | p6
+```
+
+Once integrative analysis is complete, you can rejoin the layers - which collapses the individual datasets together and recreates the original `counts` and `data` layers. You will need to do this before performing any differential expression analysis. However, you can always resplit the layers in case you would like to reperform integrative analysis.
+
+```{r joinlayers}
+obj <- JoinLayers(obj)
+obj
+```
+
+Lastly, users can also perform integration using sctransform-normalized data (see our [SCTransform vignette](https://satijalab.org/seurat/articles/sctransform_vignette) for more information), by first running SCTransform normalization, and then setting the `normalization.method` argument in `IntegrateLayers`.
+
+```{r, include=FALSE}
+obj <- LoadData("pbmcsca")
+obj <- subset(obj, nFeature_RNA > 1000)
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Method)
+```
+
+```{r sct}
+options(future.globals.maxSize = 3e+09)
+obj <- SCTransform(obj)
+obj <- RunPCA(obj, npcs = 30, verbose = F)
+obj <- IntegrateLayers(object = obj, 
+                           method = RPCAIntegration,
+                           normalization.method="SCT",
+                           verbose = F)
+obj <- FindNeighbors(obj, dims = 1:30,reduction = 'integrated.dr')
+obj <- FindClusters(obj, resolution = 2)
+obj <- RunUMAP(obj, dims = 1:30,reduction = 'integrated.dr')
+```
+
+<details>
+  <summary>**Session Info**</summary>
+```{r}
+sessionInfo()
+```
+</details>
