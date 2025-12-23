@@ -1,3 +1,3 @@
-# singlecell
+# single cell RNA-seq project 2022
 
-for single cell workflow, store data in order to `git clone` quickly on google colab.
+project data is in: [google drive](https://drive.google.com/drive/folders/1gANH-T6p2-AbUAvo8IkG6hzOuV4gsOJ0?usp=drive_link)
