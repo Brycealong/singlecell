@@ -1,0 +1,438 @@
+---
+title: "QC_to_Clustering_Seurat"
+output: html_document
+date: "2026-02-05"
+---
+
+Throughout this script we will
+
+1.  Apply quality control parameters to retain only high quality cells\
+2.  Normalize and scale the data\
+3.  Apply dimensional reduction\
+4.  Perform Clustering
+
+This script largely follows the standard unsupervised clustering workflow by [Seurat](https://satijalab.org/seurat/articles/pbmc3k_tutorial){target="_blank"} with slight deviations and a different data set.
+
+## Load the packages
+
+```{r}
+#| message: false
+
+library(tidyverse) # dplyr and ggplot2
+library(Seurat) # Seurat toolkit
+library(hdf5r) # for data import
+library(patchwork) # for plotting
+library(presto) # for differential expression
+library(glmGamPoi) # for sctransform
+
+
+```
+
+## Load the Seurat Object
+
+Here, we will start with the data stored in a Seurat object.
+
+```{r}
+obj <- readRDS("../outputs/merged_Seurat_obj.rds")
+```
+
+Examine the object
+
+```{r}
+glimpse(obj)
+```
+
+## Quality Control
+
+The goal of quality control is to keep only high quality cells (i.e., remove low quality cells (dead or dying cells), cell-free RNA, or doublets). Low quality cells will impact downstream analyses.
+
+Quality control should be applied on a sample per sample basis. Here, we will look at quality across all samples and then decide if quality thresholds need to be applied independently. If samples display the same distributions in quality metrics, it is likely okay to apply the same thresholds across all samples. If they do not follow the same distributions, you may lose valuable information by processing the samples together with the same thresholds.
+
+### QC metrics
+
+There are several metrics that can be used to assess overall quality. The base workflow from Seurat suggests the following:
+
+-   `nCount_RNA` - the absolute number of RNA molecules (UMIs) per cell (i.e., count depth). Each unique RNA molecule (non-PCR duplicates) will have its own Unique Molecular Identifier (UMI).
+
+    -   high total count - potential doublets or multiplets
+    -   low total count - potential ambient mRNA (not real cells)\
+    -   Cell Ranger threshold set at 500 UMIs
+
+-   `nFeature_RNA` - number of genes expressed (detected) per cell.
+
+    -   high number of detected genes - potential doublets or multiplets\
+    -   low number of detected genes - potential ambient mRNA (not real cells)
+
+-   Percent mitochondrial(`percent.mt`) - the fraction of reads from mitochondrial genes per cell
+
+    -   high mtDNA - cellular degradation
+
+In general, low quality cells and empty droplets will have few genes (low `n_feature_RNA`, `low nCount_RNA`), whereas doublets and multiplets will exhibit high `n_feature_RNA` and high `nCount_RNA`. Low quality or dying cells will also have high `percent_mt`.
+
+BUT
+
+There are also biological explanations for some observed patterns.
+
+> Cells with a relatively high fraction of mitochondrial counts might for example be involved in respiratory processes and should not be filtered out. Whereas, cells with low or high counts might correspond to quiescent cell populations or cells larger in size. --- [Single Cell Best Practices](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html){target="_blank"}
+
+### QC metrics are stored as metadata
+
+The quality metric information is stored in the metadata (`obj@meta.data`), so we really only need to work with the metadata file to get an idea of the thresholds we want to set for quality control. We will extract this information after we calculate the percentage of mitochondrial genes.
+
+`nCount_RNA` and `nFeature_RNA` are already available to view, so we need to add the percentage of reads that mapped to the mitochondrial genome.
+
+### Add percent mitochondrial
+
+To calculate `percent.mt`, we use `PercentageFeatureSet()`, which calculates the percentage of all the counts belonging to a subset of the possible features (e.g., mitochondrial genes, ribosomal genes) for each cell.
+
+```{r}
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT\\.")
+
+```
+
+The pattern used here is species dependent. `pattern = "^MT-"`, works for human genomes, whereas `pattern = "^mt-"` works for mouse. **Here for some reason, when R reads in the count matrix, `MT-` becomes `MT.`.**
+
+```{r}
+mt_genes<-grep("^MT\\.", rownames(obj[["RNA"]]$counts.JMY_Ca),value = T)
+mt_genes
+
+```
+
+### Extract the metadata
+
+```{r}
+metadata <- obj@meta.data
+```
+
+### QC assessment
+
+The quality of the cells should be assessed considering the above metrics
+jointly and not simply in isolation.
+
+QC can be applied manually by subjectively choosing and applying
+thresholds, which can be quite arbitrary. Alternatively, QC can be
+applied automatically using adaptive thresholds like the mean absolute
+deviation (MAD) (outliers generally 3 or 5 MAD from the median).
+
+**Here, we are going to start with applying thresholds based on a
+subjective visual assessment of quality metrics.**
+
+#### Step 1: Visualize the data
+
+There are several built in functions for visualizing data with Seurat. We can use violin plots and scatter plots to check out the individual distributions and correlations between metrics.
+
+##### nCount_RNA
+
+Look at the distribution of `nCount_RNA` with a Violin plot:
+
+```{r}
+# set colors
+cnames<-setNames(rep(c("cyan3","darkgoldenrod1"),length.out=6),levels(factor(metadata$orig.ident))) 
+
+# plot
+VlnPlot(obj, features = "nCount_RNA", layer="counts", group.by="orig.ident",raster=FALSE,alpha=0) +
+  scale_fill_manual(values=cnames) 
+
+
+```
+A violin plot shows the distribution of a numeric variable across
+categorical variables of interest; it is a hybrid between a box plot and
+a density plot. The wider sections on the plot are associated with
+increased probabilities of data points being found at that location in
+the distribution. `VlnPlot`, a Seurat function that uses the Seurat
+object directly, overlays the individual data points to ease the
+interpretation of the figure. *Also here I tuned `alpha = 0` because the distribution is close to zero and dots are clouding up the visualization.*
+
+Here, we can see that we have one bulge of increased density within the
+distribution that is closer to zero.
+
+Use `ggplot2` directly and check the distributions:
+
+```{r}
+metadata %>% 
+  	ggplot(aes(color=orig.ident, x=nCount_RNA, fill= orig.ident)) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 500,color="red",linetype="dotted")
+```
+Using a density plot directly, we can see that the sample `XDL_Ca` is different from the others. **We should always be thinking
+about whether these differences are biological or technical in nature.**
+
+In this case, it might be just technical because other tumor samples from two other patients agree in terms of the curve shape. 
+
+##### Number of Genes
+
+Now, let's take a look at the number of detected features.
+
+```{r}
+VlnPlot(obj, features = "nFeature_RNA", group.by="orig.ident",
+        alpha = 0) +
+  scale_fill_manual(values=cnames) 
+
+ggplot(metadata, aes(x=nFeature_RNA,fill=orig.ident)) +
+   geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 200,color="red",linetype="dotted")
+```
+
+##### Percent mitochondrial
+
+```{r}
+VlnPlot(obj, features = "percent.mt", group.by="orig.ident",
+        alpha = 0.1) +
+  scale_fill_manual(values=cnames) +
+  geom_hline(yintercept=35,color="red")
+
+ggplot(metadata, aes(x=percent.mt,fill=orig.ident)) +
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 30,color="red",linetype="dotted")
+```
+We can see that the mitochondrial content is more spread out for the tumor samples. This could be due to technical challenges and cellular
+degradation or biology. At this point we should set the threshold higher so we don't lose any information.
+
+##### Examine these metrics together
+
+To look at how these metrics correlate, we can use `FeatureScatter()`, which can be used to visualize feature-feature relationships and also be applied to other data stored in our Seurat object (e.g., metadata columns, PC scores).
+
+```{r}
+FeatureScatter(obj, feature1 = "percent.mt", feature2 ="nFeature_RNA" , group.by="orig.ident",split.by="condition") 
+FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",group.by="orig.ident",split.by="condition",log=TRUE)
+
+
+```
+
+Again, we can also use `ggplot2` directly.
+
+```{r}
+ggplot(metadata) +
+  geom_point(aes(x=nCount_RNA,y=nFeature_RNA,fill=percent.mt > 25),shape=21,alpha=0.4) + 
+  theme_classic() +
+  scale_x_log10()+
+  scale_y_log10()+
+  facet_grid(.~condition) +
+  geom_vline(xintercept = 400,color="red",linetype="dotted")+
+  geom_hline(yintercept=250,color="red", linetype="dotted")
+
+ggplot(metadata) +
+  geom_point(aes(x=nCount_RNA,y=nFeature_RNA,fill=percent.mt > 50),shape=21,alpha=0.4) + 
+  theme_classic() +
+  scale_x_log10()+
+  scale_y_log10()+
+  facet_grid(.~condition) +
+  geom_vline(xintercept = 400,color="red",linetype="dotted")+
+  geom_hline(yintercept=250,color="red", linetype="dotted")
+
+
+
+  	  
+
+```
+Again, quality filtering should be done at a per sample level. Here,
+there are different distributions by sample types, which we may want to
+consider when filtering.
+
+There can be variation between the quality of different samples, as seen here. By not adjusting to the specific sample, you can just as easily introduce bias by keeping or removing different populations of cells for each of the samples. Best case scenario is all samples look similar and you can employ a standard filtering threshold across all samples.
+
+#### Step 2: Decide on thresholds and apply filtering
+
+Because of the different layers, you will need to break down the object to apply different thresholds by group or sample. The easiest way to do this is to work with the metadata and use the cell barcodes for filtering with `Seurat::subset()`.
+
+```{r}
+#| eval: false
+# Set one set of parameters for XDL samples; 
+# keep the rownames (Cell barcodes)
+xdl <- metadata |> filter(patient_id=="XDL", nFeature_RNA > 250, 
+                        nCount_RNA >400, percent.mt <35 ) |> 
+  rownames_to_column("Cell") |> pull(Cell) 
+
+# Set an alternative set of thresholds for the other samples; 
+# keep the rownames (Cell barcodes)
+others<- metadata |> filter(patient_id!="XDL", nFeature_RNA > 250, 
+                        nCount_RNA >400, percent.mt <25 ) |> 
+  rownames_to_column("Cell") |> pull(Cell)
+
+keep<-c(xdl,others)
+
+```
+
+
+#### Step 3: Filter
+
+Now, we can either use our filtering parameters directly with `subset()` or provide a `cells` argument. Since we are keeping most of the cells to capture the difference between tumor samples and TME samples. We set a universal threshold for percent mitochondrial (`percent.mt`) at 30 to keep most of the cells.
+
+```{r}
+#| eval: false
+# use different parameters; established above
+obj_filt<-subset(obj, cells=keep)
+```
+
+run this:
+```{r}
+# OR use the same parameters across all samples
+obj_filt<-subset(obj, nCount_RNA > 500 & percent.mt < 30 )
+
+```
+
+##### Save the quality filtered object
+
+Save the object post filtering to work with downstream. This way you can return to this point should you need to.
+
+```{r}
+#| eval: false
+saveRDS(obj_filt,"../outputs/obj_merge_filt.rds")
+```
+
+```{r}
+# Visualize the number of cell counts per sample
+obj_filt@meta.data %>% 
+  ggplot(aes(x=orig.ident, fill=orig.ident)) + 
+  geom_bar(color="black") +
+  stat_count(geom = "text", colour = "black", size = 3.5, 
+             aes(label = ..count..),
+             position=position_stack(vjust=0.5))+
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Number of Cells per Sample")
+```
+
+**Once you have subset your object, it is recommended to run through these plots again. We are skipping this here.**  
+
+## Normalization, find variable features, and scale
+
+### Standard protocol: NormalizeData, FindVariableFeatures, and ScaleData
+```{r}
+#| eval: false
+
+#normalize
+obj_filt <- NormalizeData(obj_filt, 
+                          normalization.method = "LogNormalize", 
+                          scale.factor = 10000)
+
+# find variable features
+obj_filt <- FindVariableFeatures(obj_filt, selection.method = "vst",
+                                 nfeatures = 2000)
+
+# # Identify the 10 most highly variable genes
+# top10 <- head(VariableFeatures(obj_filt), 10)
+# 
+# # plot variable features with and without labels
+# plot1 <- VariableFeaturePlot(obj_filt)
+# LabelPoints(plot = plot1, points = top10, repel = TRUE)
+
+all.genes <- rownames(obj_filt)
+obj_filt <- ScaleData(obj_filt, features = all.genes)
+# obj_filt <- ScaleData(obj_filt, vars.to.regress = "percent.mt")
+
+
+```
+Normalized counts are stored in data layers; for example, we can access the log normalized counts of W10 using `obj_filt@assays$RNA$counts.W10`. `ScaleData()` are stored at `obj_filt[["RNA"]]$scale.data`.
+
+### SCTransform
+
+Rather than relying on the above steps (`NormalizeData()`, `FindVariableFeatures()`, and `ScaleData()`), we are going to proceed with a newer method (`SCtransform`) instead. This method uses Pearson residuals for transformation, which better accounts for the overall distribution of expression. This method assigns greater weight to lowly expressed genes that may exhibit cell type specific expression rather than highly expressed genes with broad expression.
+
+#### Things to know  
+
+> * Transformed data will be available in the SCT assay, which is set as the default after running sctransform. 
+>
+> * During normalization, we can also remove confounding sources of variation, for example, mitochondrial mapping percentage  
+>  
+> * The glmGamPoi package substantially improves speed and is used by default if installed, with instructions here --- [SCTransform vignette](https://satijalab.org/seurat/articles/sctransform_vignette){target=_blank}  
+
+Also, by default, the scaled data layer (`adp_filt[["SCT"]]$scale.data`) only contains variable features (3,000). This saves substantial memory.  
+
+Let's run the function. Notice that we are regressing out the effect of percent mitochondria. Of note, if we think differences in mitochondrial gene expression are highly related to biology, we may not want to do this, as it could help with clustering. We can always repeat steps as needed. This analysis can be highly interactive.    
+
+For certain functions, each worker needs access to certain global variables. If these are larger than the default limit, you will see this error. To get around this, you can set `options(future.globals.maxSize = X)`, where X is the maximum allowed size in bytes. So to set it to 1GB, you would run `options(future.globals.maxSize = 1000 * 1024^2)`. Note that this will increase your RAM usage so set this number mindfully. For more information, see https://satijalab.org/seurat/archive/v3.1/future_vignette.
+
+```{r}
+#| message: false 
+#| cache: true
+#| cache-lazy: false
+ 
+options(future.globals.maxSize = 1000 * 1024^2)
+obj_filt <- SCTransform(obj_filt, vars.to.regress = "percent.mt", verbose = FALSE)
+```
+
+## Linear dimension reduction
+
+Principal component analysis (PCA) is a linear dimension reduction method applied to highly dimensional data. The goal of PCA is to reduce the dimensionality of the data by transforming the data in a way that maximizes the variance explained. The first PC explains the most variance, followed by the second PC, and so on so on. 
+
+> To overcome the extensive technical noise in any single feature (gene) for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset.
+
+We run PCA using `RunPCA()` on our SCtransformed data.
+
+```{r}
+obj_filt <- RunPCA(obj_filt, verbose = FALSE,assay="SCT")
+```
+After we run PCA, we need to decide which PCs to include in downstream analyses. We want to include enough PCs to retain the biological signal, but few enough PCs to avoid interference by noise in the data.  
+
+### Exploring the PCA results
+
+There are a number of ways to explore the PCA results. Two of the more useful visualizations include the `DimHeatmap()` and `ElbowPlot()`.
+
+`DimHeatmap()` allows us to visualize the top genes contributing to each PC. Both cells and genes are sorted by their principal component scores. By default it includes the top 30 genes with the highest and lowest PC loadings.
+
+Here you can see how well a PC separates populations of cells.
+
+```{r}
+# dimensions 1 to 9
+DimHeatmap(obj_filt, dims = 1:9, cells = 500, balanced = TRUE,ncol=3)
+```
+
+```{r}
+#dimensions 20 to 30
+DimHeatmap(obj_filt, dims = 20:30, cells = 500, balanced = TRUE,ncol=3)
+```
+
+Complementing the above heatmap, we can also create an elbow plot, which produces [a ranking of principle components based on the percentage of variance explained by each one](https://satijalab.org/seurat/articles/pbmc3k_tutorial#determine-the-dimensionality-of-the-dataset){target="_blank"}.
+
+```{r}
+ElbowPlot(obj_filt, ndims = 40)
+```
+
+We can see the amount of variance explained tapers off around 15. Perhaps this is a good starting point?
+
+Here, we keep resolution fairly low to get a preliminary idea of the broad cell types. Feel free to play with the resolution to see how this impacts clustering. The Seurat developers suggest a resolution of 0.4-1.2 for data sets of \~3,000 cells.
+
+```{r}
+#| cache: true
+#| cache-lazy: false
+
+obj_filt <- FindNeighbors(obj_filt, dims = 1:15)
+
+
+obj_filt <- FindClusters(obj_filt, resolution = 0.1)
+```
+
+Now we can visualize our clusters using a non-linear dimension reduction method. UMAPs (uniform manifold approximation and projection) and t-SNE (t -stochastic neighbor embedding) are common reduction / visualization techniques for single cell data sets. UMAP has recently become the gold standard for this type of analysis due to its computational efficiency and ability to better maintain global structure.
+
+Here, we run UMAP to embed the complexity of the data within a two-dimensional plot.
+
+```{r}
+#| cache: true
+#| cache-lazy: false
+
+obj_filt <- RunUMAP(obj_filt,dims = 1:30)
+
+```
+
+```{r}
+#| fig-width: 8
+#| fig-height: 9
+DimPlot(obj_filt, reduction = "umap", group.by = c("orig.ident", "seurat_clusters","condition","patient_id"),
+        alpha=0.4, ncol=2)
+```
+
+Take a moment to save your object at this point.
+
+```{r}
+#| eval: false
+
+saveRDS(obj_filt, "../outputs/obj_filt_sctran_clust0.1.rds")
+```
+
