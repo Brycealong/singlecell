@@ -1,0 +1,36 @@
+---
+title: "Generate_Plots"
+output: html_document
+date: "2026-02-06"
+---
+
+```{r}
+#| message: false
+#Get patchwork
+#To install use install.packages('patchwork')
+#load 
+library(patchwork)
+
+#Get cowplot
+#To install use install.packages('cowplot')
+#load 
+library(cowplot)
+
+#We will also use ggplot2
+library(ggplot2)
+
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 9
+nCount_RNA_violin + nFeature_RNA_violin + percent.mt_violin + 
+  nCount_RNA_density + nFeature_RNA_density + percent.mt_density +
+  nFeature_RNA_by_percent.mt_fs + nFeature_RNA_by_nCount_RNA_fs +
+  plot_layout(ncol = 3, guides = "collect")
+```
+```{r}
+ggsave("../plots/combined_plots/patched_QC.png",height=9,width=12,dpi=600,units="in")
+```
+
+
