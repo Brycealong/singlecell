@@ -1,0 +1,493 @@
+---
+title: "Differential Expression and Classification"
+output: html_document
+date: "2026-02-01"
+---
+
+Throughout this script we will
+
+1.  Explore setting and visualizing identities in a single cell dataset\
+2.  Perform differential expression analysis through Seurat\
+3.  Use differentially expressed genes to classify cells\
+4.  Run a case test of cell type annotation using SingleR
+
+This script largely follows the standard unsupervised clustering workflow by [Seurat](https://satijalab.org/seurat/articles/pbmc3k_tutorial){target="_blank"} and the differential expression testing [vignette](https://satijalab.org/seurat/articles/de_vignette){target="_blank"}, with slight deviations and a different data set.
+
+## Load the packages
+
+```{r packages}
+#| message: false
+
+library(tidyverse) # dplyr and ggplot2; CRAN
+library(Seurat) # Seurat toolkit; CRAN
+library(hdf5r) # for data import; CRAN
+library(patchwork) # for plotting; CRAN 
+library(presto) # for differential expression; Github
+library(glmGamPoi) # for sctransform; Bioconductor
+library(ggplot2) # for visualization; installed with tidyverse
+library(dplyr) #just to make sure it was called; installed with tidyverse
+
+
+library(SingleR) # for cell type annotation; Bioconductor
+library(celldex) # for cell type annotation reference; Bioconductor
+library(MAST) # for differential expression; Bioconductor
+
+```
+
+## Load the Seurat Object
+
+```{r LoadData}
+obj <- readRDS("../outputs/obj_filt_sctran_clust0.1.rds")
+mem.maxVSize()
+mem.maxVSize(vsize=16384*4)
+```
+
+Examine the object:
+
+```{r glimpseData}
+glimpse(obj)
+```
+
+### Reviewing the Data
+
+As we can see above, the `glimpse` command shows the metadata that can be used to classify the cells. Within Seurat, the metadata is used to define the "identity" of the dataset. This is critical, as the labels within the categories will be used to determine which groups of cells are being compared. One method of viewing the available labels is to use the `table` function, which lists the frequency of each label:
+
+```{r viewConditions}
+table(obj$condition)
+```
+
+The `table` function can also be used in two dimensions:
+
+```{r viewConditions-2}
+table(obj$condition,obj$orig.ident)
+```
+
+Before running any sort of differential expression, the identity of the Seurat object needs to be explicitly defined. Different identities can be assigned, based on what needs to be analyzed. Recall this visualization of the original identities, clusters, patients, and sample types:
+
+```{r clusterPlot}
+#| fig-width: 8
+#| fig-height: 9
+DimPlot(obj, reduction = "umap", group.by = c("orig.ident", "seurat_clusters","condition","patient_id"),
+        alpha=0.4, ncol=2)
+        
+```
+
+Here we will set the identity to the clusters, and view the frequency of the resulting cell identities:
+
+```{r setClusters}
+Idents(obj) <- "SCT_snn_res.0.1"
+table(Idents(obj))
+```
+
+## Differential Expression
+
+Single cell RNASeq is notorious for not having a normal distribution of gene expression. For technical reasons, scRNASeq has a transcript recovery rate between 60%-80%, which naturally skews the gene expression towards the non-expressed end.
+
+```{r Gapdh-distribution}
+plot(density(sample(JoinLayers(obj@assays$RNA)$count["GAPDH",],2500)),cex=0,lty=1, main="Density of GAPDH in 2500 random cells")
+hist(sample(JoinLayers(obj@assays$RNA)$count["GAPDH",],2500),breaks=99,main="Histogram of GAPDH in 2500 random cells",ylab="Frequency",xlab="Gene counts")
+```
+
+The Seurat tool acknowledges this, and by default uses the Wilcoxon rank-sum test to identify differentially expressed genes, via the `presto` package. Another algorithm that is often used is `MAST`, which implements a hurdle model to determine the likelihood that a gene is genuinely not expressed in a cell, or if it is more likely a technical dropout.
+
+### Running Differential Expression in Seurat
+
+The primary means of running differential expression in Seurat is through the `FindMarkers` function. The main usage for this function is as follows:
+
+`FindMarkers(object,ident.1= ..., ident.2=..., test.use="wilcox", min.pct = 0.01, logfc.threshold = 0.1)`
+
+-   `object`: The Seurat object being examined
+-   `ident.1`: The first or main label in the comparison. Positive fold change values indicate upregulation in `ident.1`
+-   `ident.2`: The second label in the comparison. If `ident.2` is not defined, it is automatically set to all remaining cells in the comparison. In contrast to `ident.1`, negative fold changes indicated upregulation in `ident.2`.
+-   `test.use`: The statistical test that is used to compare genes between `ident.1` and `ident.2`. The default values is the Wilcoxon rank-sum test
+-   `min.pct`: The minimum fraction of cells in at least one of the two groups that must express the gene in order to be compared. If this value is not exceeded in *both* populations, the gene is excluded from the differential expression analysis.
+-   `logfc.threshold`: The minimum difference in average fold change between the two populations before the gene is evaluated. If the gene is below the threshold, i.e. the expression between the populations is too similar, the gene will excluded from the DE analysis.
+
+In the event that a user wants to recover DE statistics for all genes, `min.pct` and `logfc.threshold` can be set to 0. Additional parameters, including other statistical tests, can be found in the Help menu for `FindMarkers`.
+
+#### Prepare the dataset for analysis
+
+In Seurat (since version 4), differential analysis requires a preprocessing step to appropriately scale the normalized SCTransform assay across samples:
+
+```{r PrepSCTFindMarkers}
+obj <- PrepSCTFindMarkers(obj)
+```
+
+As covered earlier, the identities of the Seurat object will also need to be defined. To start, we will use the clusters that were generated:
+
+```{r setClustIdents-2}
+Idents(obj) <- "SCT_snn_res.0.1"
+```
+
+It is also strongly recommended to explicitly set the `SCT` assay as the basis for the differential expression.
+
+```{r setDefaultAssay}
+DefaultAssay(obj) <- "SCT"
+```
+
+::: callout-warning
+Under no circumstances should the batch corrected or `integrated` assay be used for differential expression. The batch correction is used primarily for dimensionality reduction, UMAP/T-SNE visualization, and clustering. In order to optimize this process, only a select subset of highly variable genes (\~3000) is used, and this is reflected in the size of the assay. If differential expression is run on this assay, the differences will be accentuated, and only return the \~3000 genes that were selected for batch correction.
+:::
+
+#### FindAllMarkers
+
+The `FindAllMarkers` function is particularly useful in identifying the differentially expressed genes that distinguish several groups, such as seen here in the clusters. What makes this unique is that none of the identities are initially defined, as each identity will be compared with the rest of the cohort.
+
+```{r FindAllMarkers}
+de_allClusters <- FindAllMarkers(obj, test.use="wilcox", min.pct=0.1, only.pos=TRUE)
+```
+
+We can peek at the results using the following commands:
+
+```{r FindAllMarkers-results}
+head(de_allClusters)
+nrow(de_allClusters)
+```
+
+The differential expression table from `FindAllMarkers` contains the following statistics:
+
+-   `p_val`: The raw p-value as calculated by the chosen algorithm.
+
+-   `avg_log2FC`: The average log2 fold change between the first group and the second group. In this case, it is the cluster in question and the remainder of the cells, respectively.
+
+-   `pct.1`: The fraction of cells in the first group (cluster in question) that express the gene.
+
+-   `pct.2`: The fraction of cells in the second group (all other cells) that express the gene.
+
+-   `p_val_adj`: The adjusted p-value, as determined using False Discovery Rate (also known as Benjamini-Hochberg) algorithm.
+
+-   `cluster`: The cluster that was being evaluated as "Population 1". - `gene`: Reiterates the gene that is being evaluated. This is necessary because R requires unique row names.
+
+Here we will take a look at the top 5 positively differentially expressed genes of each cluster:
+
+```{r top5Markers}
+top5PerCluster <- matrix(ncol=7)
+colnames(top5PerCluster) <- colnames(de_allClusters)
+for (i in 0:16){
+  top5PerCluster <- rbind(top5PerCluster, head(de_allClusters[which(de_allClusters$cluster==i),], 5))
+}
+top5PerCluster<-top5PerCluster[-1,]
+top5PerCluster
+
+```
+
+```{r DoHeatmap}
+DoHeatmap(obj,features = top5PerCluster$gene,slot="scale.data")
+```
+
+#### FindMarkers
+
+Many experiments look to compare to distinct populations, and scRNASeq is no exception. The two populations being compared can vary wildly from experiment to experiment; some look to draw comparisons based on the experimental condition, while others may look to compare different clusters within the experiment itself.
+
+Here, we will be drawing a comparison between the two sample types. First, we need to set the identities of the object:
+
+```{r setTimePoint}
+Idents(obj) <- "condition"
+table(Idents(obj))
+```
+
+And then we set up `FindMarkers` to compare our two conditions:
+
+```{r FindMarkers}
+t_tme_de<-FindMarkers(obj,ident.1="T",ident.2="TME",test.use="wilcox")
+head(t_tme_de, 10)
+```
+
+As you can see, most of the column headers are the same as the results from FindAllMarkers; in fact, there are fewer because the system does not need to account for which cluster is being compared against the rest and all the gene IDs should be unique. As mentioned previously, `ident.1` will have the placeholder of the positive fold change. Another visualization of the differential expression can be performed using the `FeaturePlot` function:
+
+```{r FeaturePlot-timepoint}
+fig1 <- DimPlot(obj,group.by="condition")
+fig2 <- FeaturePlot(obj,features="KRT5",order=T)
+fig3 <- FeaturePlot(obj,features="CD3D",order=T)
+fig4 <- FeaturePlot(obj,features="COL1A1",order=T)
+
+(fig1|fig2)/(fig3|fig4)
+# fig2
+```
+
+#### Pseudobulk Differential Expression
+
+One particular critique of differential expression in single cell RNASeq analysis is p-value "inflation," where the p-values get so small that there are far too many genes exist with p-values below 0.05, even after adjustment. This is caused by the nature of scRNASeq, where each individual cell essentially consists of a single replicate; as the replicate count increases, the p-values tend to shrink. Generally, we recommend using the DE values as a guide for significant differential gene identification, as opposed to using the p-value for a hard cutoff. The p-value, which is an expression of a probability of a real result, should be examined in context with the remaining statistics, such as fraction expression (`pct.1` and `pct.2`) and fold change. The entire picture of the statistical comparison will aid in determining which events are likely to be real and therefore actionable pursuits.
+
+One method to counter the p-value inflation is to run a pseudobulk analysis. In this process, the total gene counts for each population of interest is aggregated across cells, and then these total counts can be treated in the same manner as a bulk RNASeq experiment. Through this process, the replicate inflation is overcome, as well as any cell-to-cell variation that may be excessively skewing results.
+
+Here, the pseudobulk DE is run between timepoints, as before. It starts with the `AggregateExpression` function in Seurat, and collapsing the counts by replicate. Be sure to include all potential metadata that will be of interest.
+
+```{r AggregateExpression}
+pseudo_obj<-AggregateExpression(obj,assays="RNA", return.seurat=T, group.by=c("orig.ident","condition","patient_id"))
+
+head(pseudo_obj@assays$RNA$counts)
+pseudo_obj@meta.data
+
+#just to clean up the look a little bit
+pseudo_obj <- RenameCells(pseudo_obj,new.names=gsub("_.*","",pseudo_obj$orig.ident))
+pseudo_obj$orig.ident<-gsub("_.*","",pseudo_obj$orig.ident)
+head(pseudo_obj@assays$RNA$counts)
+pseudo_obj@meta.data
+
+```
+
+The data now is a matrix of counts by sample, as opposed to counts by cell. DESeq2 may now be run on the pseudobulk data:
+
+```{r FindMarkers-pseudobulk}
+Idents(pseudo_obj)<-"condition"
+bulk_obj_de <- FindMarkers(pseudo_obj, ident.1="T", ident.2="TME", test.use="DESeq2")
+head(bulk_obj_de)
+```
+
+Comparing the results between the single cell and pseudobulk analysis shows that there are more genes identified as significantly dysregulated via scRNASeq DE; the overall concordance sits at about 70% of the pseudobulk genes.
+
+```{r compareDE}
+scDE.genes <- rownames(t_tme_de)[which(t_tme_de$p_val_adj<0.05)]
+bulkDE.genes <- rownames(bulk_obj_de)[which(bulk_obj_de$p_val_adj<0.05)]
+length(scDE.genes)
+length(bulkDE.genes)
+length(intersect(scDE.genes,bulkDE.genes))
+```
+
+## Visualizing Differentially Expressed Genes
+
+In addition to the `Heatmap` and the `FeaturePlot` shown previously, two other options easily accessible through Seurat are the Dot Plot and Violin Plot. The dot plot can visualize relative expression level and expression fraction. Using the same genes from the cluster-derived DE results:
+
+```{r DotPlot}
+#| fig-width: 8
+#| fig-height: 9
+Idents(obj)<-"SCT_snn_res.0.1"
+DotPlot(obj,features=unique(top5PerCluster$gene),dot.scale = 3)+coord_flip()
+```
+
+```{r}
+Idents(obj) <- "condition"
+VlnPlot(obj,features=c("CXCL8","APOD"),alpha = 0.1)
+```
+
+Striation is normal. The SCTransform technique normalizes the counts themselves at the per-gene and per-sample levels, while the older log-normalization/scaling approach created a more continuous count distribution.
+
+## Cell Annotation
+
+### Annotation using SingleR
+
+Today, we will be focusing on the SingleR tool, which also requires the [`celldex` package](https://bioconductor.org/packages/release/data/experiment/html/celldex.html){target="_blank"}. In short, SingleR operates by comparing your current dataset against a reference dataset, mostly through correlative gene expression. It then assigns a score for the expression set (i.e. each cell or cluster being compared) for all possible reference labels. This walkthrough will explore using one of the default references from `celldex` to try to assign annotations to our current dataset.
+
+SingleR requires that the data be mildly transformed into a different data structure. It is also slightly more efficient to retrieve and store the reference dataset from `celldex` preemptively. This also gives the opportunity to peek into the reference data itself.
+
+```{r SingleR_prep}
+obj.sce <- as.SingleCellExperiment(obj,assay="SCT") #This selects *only* the SCT assay
+humanRNASeq <- celldex::HumanPrimaryCellAtlasData()
+head(humanRNASeq)
+table(humanRNASeq$label.main)
+table(humanRNASeq$label.fine)
+```
+
+For many of the `celldex` datasets, there are two separate categories of labels. The `main` labels capture the family of cell types available (e.g. T cells), while the `fine` category captures the specific subtypes (e.g. Cd4 effector T cells). The references in `celldex` are species-specific, which has to be accounted for in any reference-based cell type annotation.
+
+::: callout-warning
+#### Your annotation is only as good as your reference!
+
+In many cases, one of the default reference datasets from celldex will be a sufficient starting point. However, some studies will require more specific cell types than what can be retrieved from `celldex`. In these cases, one may consider retrieving a dataset from the Bioconductor package [`scRNAseq`](https://bioconductor.org/packages/release/data/experiment/vignettes/scRNAseq/inst/doc/scRNAseq.html){target="_blank"} or from the Chan-Zuckerberg Biohub, which has collected and annotated cell types from multiple organs from both mouse ([Tabula muris](https://www.czbiohub.org/sf/tabula-muris/){target="_blank"}) and human ([Tabula sapiens](https://tabula-sapiens-portal.ds.czbiohub.org/){target="_blank"}) samples.
+:::
+
+#### Version 1: Cell-level cell type annotation
+
+When using SingleR, the 3 primary parameters are the experimental dataset, the reference dataset, and the labels being used. Continuing with the `main` labels of the MouseRNASeq dataset on the full dataset looks like this:
+
+```{r SingleR-cell}
+annot <- SingleR(test=obj.sce, ref=humanRNASeq, labels=humanRNASeq$label.main)
+head(annot)
+```
+
+This particular step can take a while, since it compares every cell in the dataset against every cell type transcriptome in the reference.
+
+The results from SingleR are returned as a dataframe:
+
+-   `scores`: Correlation scores for each cell against each of the reference columns. Accessed as `annot$scores` in this case
+
+-   `labels`: Initial labels based on highest scoring cell type annotation
+
+-   `delta.next`: The difference in scores between the highest and second-highest scoring annotations
+
+-   `pruned.labels`: SingleR determines if a label should be discarded because the `delta.next` value is too small, i.e. the label can be ambiguous. Any discarded labels will be replaced with `NA`.
+
+Here, the `pruned.labels` are added to the meta.data
+
+```{r assignLabels-1}
+table(annot$pruned.labels, useNA="ifany") #useNA can be used turned on in the `table` function
+obj$humanRNASeq.main<-annot$pruned.labels
+```
+
+This is actually a great example of the warning above. The dataset is *specifically* skin cells and immune cells, and should only have a smattering of alternative cell types. However, there are a number of other cell types and it might be biological or just because of the quality of the annotation.
+
+```{r visSingleR-cell}
+#| fig-width: 9
+annotFig <- DimPlot(obj,group.by="humanRNASeq.main")
+
+annotFig
+```
+
+#### Version 2: Cluster-level cell type annotation
+
+Much like pseudobulk differential expression, the RNA expression can be collapsed into pre-defined components, such as the clusters, if it is believed that cell-to-cell variation is inducing too much confusion in the labeling. This collapsing can be performed using either the `AggregateExpression` or `AverageExpression` functions, as seen previously. The resulting matrix can then be fed into SingleR to produce the cluster-based annotations.
+
+```{r SingleR-cluster}
+Idents(obj)<-"SCT_snn_res.0.1" #Assign clusters as the identities
+avgExp <- AverageExpression(obj, assays="SCT")$SCT #Run AverageExpression on the SCT assay and return only SCT
+clustAnnot<-SingleR(test=avgExp, ref=humanRNASeq, labels=humanRNASeq$label.main) #Run SingleR on the averaged expression matrix
+clustAnnot
+```
+
+As before, most of the labels are assigned to either fibroblasts and adipocytes. The data takes a little massaging to assign to the scRNASeq metadata, but it is doable.
+
+```{r visSingleR-cluster}
+#| fig-width: 10
+#| fig-height: 8
+clustLabels <- as.vector(clustAnnot$pruned.labels) #retrieve only the cluster-derived annotations
+names(clustLabels) <- c(0:16) #assign the cluster numbers as the annotations
+clustLabels.vect <- clustLabels[match(obj$SCT_snn_res.0.1, names(clustLabels))] #match the cluster identities per cell in the Seurat data to the cluster labels
+names(clustLabels.vect) <- colnames(obj) #ensure that the cluster identities are assigned the cell names
+obj$humanRNASeq.main.clust <- clustLabels.vect #add the cluster annotations to the vector
+
+clustAnnotFig1 <- DimPlot(obj,group.by="SCT_snn_res.0.1",label=T)+NoLegend()
+clustAnnotFig2 <- DimPlot(obj,group.by="condition")
+clustAnnotFig3 <- DimPlot(obj,group.by="humanRNASeq.main")
+clustAnnotFig4 <- DimPlot(obj,group.by="humanRNASeq.main.clust")
+
+# (clustAnnotFig1|clustAnnotFig2)/clustAnnotFig3/clustAnnotFig4
+clustAnnotFig4 + 
+  labs(title = paste0("k = ", ncol(obj), " cells")) +
+  theme(plot.title = element_text(hjust = 0))
+```
+```{r eval=FALSE}
+ggsave("../plots/single_plots/singleR_clustAnnot.png",height=8,width=10,dpi=600,units="in")
+```
+
+Generally, the annotation between the per-cell annotation coincides with the per-cluster annotation. This image is also somewhat cleaner, as the cell-to-cell variation is superseded into the clusters. However, this also provides an example where this "collapsing" process can lead to smaller populations being overlooked.
+
+## Differential composition analysis
+
+We utilize our annotations to identify differences in the proportion of different cell types between tumor samples and TME samples, and between patients.
+
+```{r}
+## Differential composition analysis
+
+df_comp <- as.data.frame.matrix(table(obj$orig.ident, obj$humanRNASeq.main.clust))
+df_comp_relative <- sweep(x = df_comp, MARGIN = 1, STATS = rowSums(df_comp), FUN = '/')
+
+df_condition <- as.data.frame.matrix(table(obj$orig.ident, obj$condition))
+df_patient <- as.data.frame.matrix(table(obj$orig.ident, obj$patient_id))
+
+df_comp_relative$condition <- ifelse(df_condition$T != 0, 'T', 'TME')
+df_comp_relative$condition <- factor(df_comp_relative$condition, levels = c('T', 'TME'))
+df_comp_relative$patient_id <- colnames(df_patient)[max.col(df_patient)]
+```
+
+### Compare proportions of annotated cell types between T and TME conditions
+
+```{r, fig.width=10, fig.height=4}
+p1 <- ggplot(data = df_comp_relative, aes(x = condition, y = Epithelial_cells, fill = condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c("cyan3", "darkgoldenrod1")) +
+  xlab("") + ylab('relative abundance') +
+  ggtitle('Epithelial_cells') +
+  geom_jitter(color = "black", size = 0.4, alpha = 0.9) +
+  theme_bw()
+
+p2 <- ggplot(data = df_comp_relative, aes(x = condition, y = T_cells, fill = condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c("cyan3", "darkgoldenrod1")) +
+  xlab("") + ylab('relative abundance') +
+  ggtitle('T_cells') +
+  geom_jitter(color = "black", size = 0.4, alpha = 0.9) +
+  theme_bw()
+
+p1 + p2 + plot_layout(ncol = 2)
+```
+
+### Compare proportions of annotated cell types between 3 patients
+
+```{r, fig.width=10, fig.height=4}
+p3 <- ggplot(data = df_comp_relative, aes(x = patient_id, y = Epithelial_cells, fill = patient_id)) +
+  geom_boxplot(outlier.shape = NA) +
+  xlab("") + ylab('relative abundance') +
+  ggtitle('Epithelial_cells') +
+  geom_jitter(color = "black", size = 0.4, alpha = 0.9) +
+  theme_bw()
+
+p4 <- ggplot(data = df_comp_relative, aes(x = patient_id, y = T_cells, fill = patient_id)) +
+  geom_boxplot(outlier.shape = NA) +
+  xlab("") + ylab('relative abundance') +
+  ggtitle('T_cells') +
+  geom_jitter(color = "black", size = 0.4, alpha = 0.9) +
+  theme_bw()
+
+p3 + p4 + plot_layout(ncol = 2)
+```
+
+```{r fig.width=10, fig.height=4}
+## Differential composition analysis
+df <- data.frame(
+  cell_type = obj$humanRNASeq.main.clust,
+  patient_id = obj$patient_id,
+  condition = obj$condition
+)
+
+cell_order <- df %>%
+  dplyr::count(cell_type) %>%
+  arrange(n) %>%
+  pull(cell_type)
+
+df$cell_type <- factor(df$cell_type, levels = cell_order)
+
+# Left panel: proportion by patient within each cell type
+p1 <- df %>%
+  dplyr::count(cell_type, patient_id) %>%
+  group_by(cell_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = prop, y = cell_type, fill = patient_id)) +
+  geom_col(position = "stack", width = 0.7, color = "black", linewidth = 0.5) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2), 
+                     limits = c(0, 1), 
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = NULL, fill = "Patient") +
+  theme_classic() +
+  theme(legend.position = "top")
+
+# Middle panel: proportion by condition within each cell type
+p2 <- df %>%
+  dplyr::count(cell_type, condition) %>%
+  group_by(cell_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = prop, y = cell_type, fill = condition)) +
+  geom_col(position = "stack", width = 0.7,
+           color = "black", linewidth = 0.5) +
+  scale_fill_manual(values = c("T" = "red3", "TME" = "royalblue")) +
+  scale_x_continuous(breaks = seq(0, 1, 0.2), 
+                     limits = c(0, 1), 
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = NULL, fill = "Condition") +
+  theme_classic() +
+  theme(axis.text.y = element_blank(), 
+        legend.position = "top", 
+        legend.title = element_blank())
+
+# Right panel: total cell count per cell type
+p3 <- df %>%
+  dplyr::count(cell_type) %>%
+  ggplot(aes(x = n, y = cell_type)) +
+  geom_col(fill = "grey60", width = 0.7,
+           color = "black", linewidth = 0.5) +
+  scale_x_continuous(expand = c(0, 0), labels = scales::comma) +
+  labs(x = NULL, y = NULL) +
+  theme_classic() +
+  theme(axis.text.y = element_blank())
+
+p1 + p2 + p3 + plot_layout(ncol = 3)
+```
+```{r eval=FALSE}
+ggsave("../plots/single_plots/barplots_celltype_by_patient_sample-origin_cell-num.png",height=4,width=10,dpi=600,units="in")
+```
+Save the final object with all the cell annotations.
+
+```{r, include=FALSE}
+#| eval: false
+saveRDS(obj,"../outputs/obj_final_Seurat.rds")
+```
