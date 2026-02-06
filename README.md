@@ -48,7 +48,7 @@ Raw count matrices (`.csv`) are private and available upon request. Place them i
 - Visualizes QC metrics (nCount, nFeature, percent.mt) per sample
 - Applies filtering: `nCount_RNA > 500` and `percent.mt < 30`
 - Normalizes with **SCTransform** (regressing out `percent.mt`)
-- Runs PCA (15 PCs for neighbors), FindNeighbors, FindClusters (resolution 0.1), and UMAP (30 dims)
+- Runs PCA (30 PCs for neighbors), FindNeighbors, FindClusters (resolution 0.1), and UMAP (30 dims)
 - Saves: `outputs/obj_filt_sctran_clust0.1.rds`
 
 ### 3. Differential Expression, Annotation, and Composition (`Seurat_DifferentialExpression_Classification.Rmd`)

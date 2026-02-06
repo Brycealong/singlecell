@@ -395,7 +395,17 @@ Complementing the above heatmap, we can also create an elbow plot, which produce
 ElbowPlot(obj_filt, ndims = 40)
 ```
 
-We can see the amount of variance explained tapers off around 15. Perhaps this is a good starting point?
+We can see the amount of variance explained tapers off around 30. Perhaps this is a good starting point?
+
+Of note, the Seurat developers indicate that it is safer to use a greater number of PCs when using SCTransform, which is more efficient at eliminating technical effects.
+
+## Clustering  
+
+Clustering is used to group cells by similar transcriptomic profiles. Seurat uses a graph based clustering method. You can read more about it [here](https://bioconductor.org/books/3.15/OSCA.basic/clustering.html#background){target=_blank}.   
+
+The first step is to compute the nearest neighbors of each cell based on similarity. This is done using `FindNeighbors()`, which will [construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity)](https://satijalab.org/seurat/articles/pbmc3k_tutorial#cluster-the-cells){target=_blank}. Therefore, an important argument is the dimensions of our PCA that we would like to use.  
+
+This then informs `FindClusters()`, which uses an unsupervised learning technique (modularity optimization with the Louvain algorithm) to group multiple data points into clusters based on their similarities. Importantly, this function includes a resolution parameter [that sets the ‘granularity’ of the downstream clustering, with increased values leading to a greater number of clusters](https://satijalab.org/seurat/articles/pbmc3k_tutorial#cluster-the-cells){target=_blank}.
 
 Here, we keep resolution fairly low to get a preliminary idea of the broad cell types. Feel free to play with the resolution to see how this impacts clustering. The Seurat developers suggest a resolution of 0.4-1.2 for data sets of \~3,000 cells.
 
@@ -403,7 +413,7 @@ Here, we keep resolution fairly low to get a preliminary idea of the broad cell 
 #| cache: true
 #| cache-lazy: false
 
-obj_filt <- FindNeighbors(obj_filt, dims = 1:15)
+obj_filt <- FindNeighbors(obj_filt, dims = 1:30)
 
 
 obj_filt <- FindClusters(obj_filt, resolution = 0.1)
